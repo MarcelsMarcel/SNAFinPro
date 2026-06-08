@@ -1,0 +1,17 @@
+{
+  "name": "snaproject",
+  "version": "1.0.0",
+  "description": "ComplianceAsCode demo application — Server and Network Administration Final Project",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "test": "echo \"No tests configured\" && exit 0"
+  },
+  "dependencies": {
+    "express": "4.16.0",
+    "lodash": "4.17.4"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

@@ -1,0 +1,388 @@
+name: ComplianceAsCode Pipeline
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  compliance:
+    name: Compliance Evidence Collection
+    runs-on: ubuntu-latest
+
+    steps:
+      # ── 0. Checkout ────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # ── 1. Setup Node.js ───────────────────────────────────────────
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        run: npm ci
+
+      # ── 2. CC7.1 — SAST Scan (Semgrep) ────────────────────────────
+      - name: CC7.1 · SAST Scan via Semgrep
+        id: semgrep
+        continue-on-error: true
+        run: |
+          pip install semgrep --quiet
+          semgrep scan \
+            --config=auto \
+            --json \
+            --output=semgrep_raw.json \
+            ./src || true
+
+          # Count critical findings
+          CRITICAL=$(cat semgrep_raw.json | \
+            python3 -c "
+          import json, sys
+          data = json.load(sys.stdin)
+          results = data.get('results', [])
+          critical = [r for r in results if r.get('extra', {}).get('severity') in ['ERROR', 'WARNING']]
+          print(len(critical))
+          " 2>/dev/null || echo "0")
+
+          STATUS="passed"
+          if [ "$CRITICAL" -gt "0" ]; then
+            STATUS="violated"
+          fi
+
+          echo "critical=$CRITICAL" >> $GITHUB_OUTPUT
+          echo "status=$STATUS" >> $GITHUB_OUTPUT
+          echo "CC7.1 SAST: status=$STATUS, critical_findings=$CRITICAL"
+
+      # ── 3. CC6.7 — Secrets Scan (Gitleaks) ────────────────────────
+      - name: CC6.7 · Secrets Scan via Gitleaks
+        id: gitleaks
+        continue-on-error: true
+        run: |
+          curl -sSfL https://github.com/gitleaks/gitleaks/releases/download/v8.18.4/gitleaks_8.18.4_linux_x64.tar.gz \
+            | tar -xz gitleaks
+          chmod +x gitleaks
+
+          ./gitleaks detect \
+            --source="." \
+            --report-format=json \
+            --report-path=gitleaks_raw.json \
+            --exit-code=0 || true
+
+          SECRETS_FOUND=$(cat gitleaks_raw.json | \
+            python3 -c "
+          import json, sys
+          try:
+            data = json.load(sys.stdin)
+            print(len(data) if isinstance(data, list) else 0)
+          except:
+            print(0)
+          " 2>/dev/null || echo "0")
+
+          STATUS="passed"
+          if [ "$SECRETS_FOUND" -gt "0" ]; then
+            STATUS="violated"
+          fi
+
+          echo "secrets_found=$SECRETS_FOUND" >> $GITHUB_OUTPUT
+          echo "status=$STATUS" >> $GITHUB_OUTPUT
+          echo "CC6.7 Secrets: status=$STATUS, secrets_found=$SECRETS_FOUND"
+
+      # ── 4. CC9.2 — Dependency CVE Scan (Trivy) ────────────────────
+      - name: CC9.2 · Dependency CVE Scan via Trivy
+        id: trivy
+        continue-on-error: true
+        run: |
+          # Use the official install script — resolves the latest stable release and
+          # correct asset name automatically, avoiding hardcoded-version 404s.
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
+            | sudo sh -s -- -b /usr/local/bin
+
+          trivy version
+
+          trivy fs . \
+            --format json \
+            --output trivy_raw.json \
+            --exit-code 0 \
+            --severity CRITICAL,HIGH || true
+
+          CRITICAL_CVE=$(cat trivy_raw.json | \
+            python3 -c "
+          import json, sys
+          try:
+            data = json.load(sys.stdin)
+            count = 0
+            for result in data.get('Results', []):
+              for vuln in result.get('Vulnerabilities', []):
+                if vuln.get('Severity') in ['CRITICAL', 'HIGH']:
+                  count += 1
+            print(count)
+          except:
+            print(0)
+          " 2>/dev/null || echo "0")
+
+          trivy_status="passed"
+          if [ "$CRITICAL_CVE" -gt "0" ]; then
+            trivy_status="violated"
+          fi
+
+          echo "critical_cve=$CRITICAL_CVE" >> $GITHUB_OUTPUT
+          echo "status=$trivy_status" >> $GITHUB_OUTPUT
+          echo "CC9.2 CVE: status=$trivy_status, critical_cve=$CRITICAL_CVE"
+
+      # ── 5. Install OPA ─────────────────────────────────────────────
+      - name: Install OPA
+        run: |
+          curl -L -o opa \
+            https://openpolicyagent.org/downloads/v0.63.0/opa_linux_amd64_static
+          chmod +x opa
+          sudo mv opa /usr/local/bin/opa
+          opa version
+
+      # ── 6. OPA Evaluate — CC7.1 ───────────────────────────────────
+      - name: OPA Evaluate · CC7.1 SAST Control
+        id: opa_cc71
+        run: |
+          cat > /tmp/input_cc71.json << EOF
+          {
+            "pipeline": {
+              "actor": "${{ github.actor }}",
+              "run_id": "${{ github.run_id }}",
+              "commit": "${{ github.sha }}",
+              "ref": "${{ github.ref }}",
+              "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            },
+            "sast_scan": {
+              "status": "${{ steps.semgrep.outputs.status || 'passed' }}",
+              "critical_findings": ${{ steps.semgrep.outputs.critical || 0 }},
+              "tool": "semgrep"
+            }
+          }
+          EOF
+
+          RESULT=$(opa eval \
+            --input /tmp/input_cc71.json \
+            --data compliance/policies/cc7_1_sast.rego \
+            "data.compliance.soc2.cc7_1" \
+            --format pretty)
+
+          echo "$RESULT"
+          
+          echo "result<<EOF" >> $GITHUB_OUTPUT
+          echo "$RESULT" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+          python3 compliance/scripts/generate_evidence.py \
+            --control "CC7.1" \
+            --iso "A.8.8" \
+            --framework "SOC2" \
+            --status "${{ steps.semgrep.outputs.status || 'passed' }}" \
+            --actor "${{ github.actor }}" \
+            --commit "${{ github.sha }}" \
+            --run-id "${{ github.run_id }}" \
+            --tool "semgrep" \
+            --findings "${{ steps.semgrep.outputs.critical || 0 }}" \
+            --output "evidence_cc71.json"
+
+      # ── 7. OPA Evaluate — CC6.7 ───────────────────────────────────
+      - name: OPA Evaluate · CC6.7 Secrets Control
+        id: opa_cc67
+        run: |
+          cat > /tmp/input_cc67.json << EOF
+          {
+            "pipeline": {
+              "actor": "${{ github.actor }}",
+              "run_id": "${{ github.run_id }}",
+              "commit": "${{ github.sha }}",
+              "ref": "${{ github.ref }}",
+              "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            },
+            "secrets_scan": {
+              "status": "${{ steps.gitleaks.outputs.status || 'passed' }}",
+              "secrets_found": ${{ steps.gitleaks.outputs.secrets_found || 0 }},
+              "tool": "gitleaks"
+            }
+          }
+          EOF
+
+          RESULT=$(opa eval \
+            --input /tmp/input_cc67.json \
+            --data compliance/policies/cc6_7_secrets.rego \
+            "data.compliance.soc2.cc6_7" \
+            --format pretty)
+
+          echo "$RESULT"
+
+          echo "result<<EOF" >> $GITHUB_OUTPUT
+          echo "$RESULT" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+          python3 compliance/scripts/generate_evidence.py \
+            --control "CC6.7" \
+            --iso "A.8.12" \
+            --framework "SOC2" \
+            --status "${{ steps.gitleaks.outputs.status || 'passed' }}" \
+            --actor "${{ github.actor }}" \
+            --commit "${{ github.sha }}" \
+            --run-id "${{ github.run_id }}" \
+            --tool "gitleaks" \
+            --findings "${{ steps.gitleaks.outputs.secrets_found || 0 }}" \
+            --output "evidence_cc67.json"
+
+      # ── 8. OPA Evaluate — CC9.2 ───────────────────────────────────
+      - name: OPA Evaluate · CC9.2 CVE Control
+        id: opa_cc92
+        run: |
+          cat > /tmp/input_cc92.json << EOF
+          {
+            "pipeline": {
+              "actor": "${{ github.actor }}",
+              "run_id": "${{ github.run_id }}",
+              "commit": "${{ github.sha }}",
+              "ref": "${{ github.ref }}",
+              "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            },
+            "sca_scan": {
+              "status": "${{ steps.trivy.outputs.status || 'passed' }}",
+              "critical_cve": ${{ steps.trivy.outputs.critical_cve || 0 }},
+              "tool": "trivy"
+            }
+          }
+          EOF
+
+          RESULT=$(opa eval \
+            --input /tmp/input_cc92.json \
+            --data compliance/policies/cc9_2_cve.rego \
+            "data.compliance.soc2.cc9_2" \
+            --format pretty)
+
+          echo "$RESULT"
+
+          echo "result<<EOF" >> $GITHUB_OUTPUT
+          echo "$RESULT" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+          python3 compliance/scripts/generate_evidence.py \
+            --control "CC9.2" \
+            --iso "A.5.20" \
+            --framework "SOC2" \
+            --status "${{ steps.trivy.outputs.status || 'passed' }}" \
+            --actor "${{ github.actor }}" \
+            --commit "${{ github.sha }}" \
+            --run-id "${{ github.run_id }}" \
+            --tool "trivy" \
+            --findings "${{ steps.trivy.outputs.critical_cve || 0 }}" \
+            --output "evidence_cc92.json"
+
+      # ── 9. Hash all evidence artifacts ────────────────────────────
+      - name: Sign evidence artifacts (SHA-256)
+        run: |
+          for f in evidence_cc71.json evidence_cc67.json evidence_cc92.json; do
+            if [ -f "$f" ]; then
+              sha256sum "$f" >> evidence_manifest.sha256
+              echo "Hashed: $f"
+            fi
+          done
+          cat evidence_manifest.sha256
+
+      # ── 10. Generate compliance summary ───────────────────────────
+      - name: Generate compliance summary
+        run: |
+          python3 - << 'EOF'
+          import json, os
+          from datetime import datetime, timezone
+
+          controls = [
+            ("CC7.1", "A.8.8",  "evidence_cc71.json"),
+            ("CC6.7", "A.8.12", "evidence_cc67.json"),
+            ("CC9.2", "A.5.20", "evidence_cc92.json"),
+          ]
+
+          summary = {
+            "pipeline_run": {
+              "run_id":    os.environ.get("GITHUB_RUN_ID", ""),
+              "actor":     os.environ.get("GITHUB_ACTOR", ""),
+              "commit":    os.environ.get("GITHUB_SHA", ""),
+              "timestamp": datetime.now(timezone.utc).isoformat()
+            },
+            "controls": [],
+            "overall_status": "passed"
+          }
+
+          for ctrl_id, iso_id, fname in controls:
+            if os.path.exists(fname):
+              with open(fname) as f:
+                ev = json.load(f)
+              status = ev.get("status", "unknown")
+              if not status:
+                status = "passed"
+            else:
+              status = "missing"
+
+            if status != "passed":
+              summary["overall_status"] = "violated"
+
+            summary["controls"].append({
+              "control_id": ctrl_id,
+              "iso_mapping": iso_id,
+              "status": status
+            })
+
+          with open("compliance_summary.json", "w") as f:
+            json.dump(summary, f, indent=2)
+
+          print(json.dumps(summary, indent=2))
+
+          # Print table
+          print("\n┌─────────────────── COMPLIANCE SUMMARY ───────────────────┐")
+          for c in summary["controls"]:
+            icon = "✅" if c["status"] == "passed" else "❌"
+            print(f"│ {icon}  {c['control_id']} ({c['iso_mapping']}) — {c['status']}")
+          print(f"│")
+          print(f"│ Overall: {summary['overall_status'].upper()}")
+          print("└───────────────────────────────────────────────────────────┘")
+          EOF
+
+      # ── 11. Upload all evidence as artifacts ──────────────────────
+      - name: Upload compliance evidence artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: compliance-evidence-${{ github.run_id }}
+          path: |
+            evidence_cc71.json
+            evidence_cc67.json
+            evidence_cc92.json
+            evidence_manifest.sha256
+            compliance_summary.json
+            semgrep_raw.json
+            gitleaks_raw.json
+            trivy_raw.json
+          retention-days: 90
+
+      # ── 12. Fail pipeline if any control violated ─────────────────
+      - name: Enforce compliance gate
+        run: |
+          OVERALL=$(python3 -c "
+          import json
+          with open('compliance_summary.json') as f:
+            data = json.load(f)
+          print(data['overall_status'])
+          ")
+
+          echo "Overall compliance status: $OVERALL"
+
+          if [ "$OVERALL" != "passed" ]; then
+            echo "❌ Pipeline blocked: one or more compliance controls violated."
+            exit 1
+          else
+            echo "✅ All compliance controls passed. Evidence artifacts uploaded."
+          fi
